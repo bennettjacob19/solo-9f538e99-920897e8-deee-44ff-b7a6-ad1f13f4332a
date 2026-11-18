@@ -8,12 +8,22 @@ Design summary
 * A reader pins one version inside one SQLite read transaction (WAL snapshot
   isolation), so it can never observe a mixture of the directory before and
   after a restore.  Old versions and their rows are never deleted.
+* A name is either a *terminal* (``kind='address'``) or an *alias*
+  (``kind='alias'``) pointing at another name; aliases may chain.  Aliases
+  store the target *name*, so re-addressing a terminal moves every alias that
+  reaches it in the very same version.  Writes that would create a cycle, a
+  dangling target, or leave a deleted name still referenced are rejected
+  before a new version is published.
 * A named backup pins the current version id at a single commit point, so it is
-  always a complete directory even while writes keep arriving.
-* A restore is: mark a lease -> validate the backup -> atomically create a new
-  version copied from the backup and switch ``current_version``.  The switch is
-  one transaction: after a crash/restart the directory is either the original
-  version or the complete restored version, never a partial one.
+  always a complete directory even while writes keep arriving.  Alias
+  relationships are part of the pinned version, so they are archived and
+  restored together with the addresses.  Backups created by older schema
+  versions keep their original digest format and remain restorable.
+* A restore is: mark a lease -> validate the backup (including alias-chain
+  integrity) -> atomically create a new version copied from the backup and
+  switch ``current_version``.  The switch is one transaction: after a
+  crash/restart the directory is either the original version or the complete
+  restored version, never a partial one.
 * While a restore holds a live lease, writes are rejected with
   ``RestoreInProgress``.  An expired lease (crashed restorer) is reclaimed, and
   a restorer that lost its lease aborts instead of overwriting newer state.
@@ -50,12 +60,18 @@ from .errors import (
     RestoreInProgress,
 )
 
-SCHEMA_VERSION = 1
-BACKUP_FORMAT = "svcdir-backup-v1"
+SCHEMA_VERSION = 2
+BACKUP_FORMAT_V1 = "svcdir-backup-v1"
+BACKUP_FORMAT_V2 = "svcdir-backup-v2"
+BACKUP_FORMAT = BACKUP_FORMAT_V2
 MAX_SERVICES = 5000
 MAX_ADDRESS_LENGTH = 512
 MAX_BACKUP_NAME_LENGTH = 64
 MAX_NOTE_LENGTH = 200
+MAX_CHAIN_LENGTH = 64
+
+KIND_ADDRESS = "address"
+KIND_ALIAS = "alias"
 
 SERVICE_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}\Z")
 DIGEST_RE = re.compile(r"[0-9a-f]{64}\Z")
@@ -123,19 +139,126 @@ def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
 
 
-def _compute_digest(backup_name: str, version_id: int, entries: tuple[tuple[str, str], ...]) -> str:
+@dataclass(frozen=True)
+class Entry:
+    """One directory row: a terminal address or an alias to another name."""
+
+    service: str
+    kind: str  # KIND_ADDRESS | KIND_ALIAS
+    address: str  # "" for aliases
+    target: str | None  # target service name for aliases, None otherwise
+
+    @property
+    def is_alias(self) -> bool:
+        return self.kind == KIND_ALIAS
+
+
+class _ChainError(Exception):
+    """Internal: a name cannot be resolved to a terminal address."""
+
+    code = "broken_chain"
+
+
+class _ChainCycle(_ChainError):
+    code = "alias_cycle"
+
+
+class _ChainDangling(_ChainError):
+    code = "broken_chain"
+
+
+class _ChainTooLong(_ChainError):
+    code = "chain_too_long"
+
+
+def _resolve_from(by_name: dict[str, Entry], start: str) -> tuple[str, tuple[str, ...]]:
+    """Follow the alias chain from ``start``.
+
+    Returns ``(terminal_address, chain_of_names)`` where the chain includes
+    ``start`` and ends at the terminal name.  Raises ``_ChainError`` on a
+    cycle, a dangling target, or an over-long chain.
+    """
+    chain = [start]
+    seen = {start}
+    current = start
+    while True:
+        entry = by_name.get(current)
+        if entry is None:
+            raise _ChainDangling(f"解析链断裂：{current} 不存在")
+        if not entry.is_alias:
+            return entry.address, tuple(chain)
+        nxt = entry.target or ""
+        if nxt in seen:
+            raise _ChainCycle("解析链成环：" + " → ".join(chain + [nxt]))
+        if len(chain) >= MAX_CHAIN_LENGTH:
+            raise _ChainTooLong(f"解析链超过最大长度 {MAX_CHAIN_LENGTH}")
+        seen.add(nxt)
+        chain.append(nxt)
+        current = nxt
+
+
+def _resolve_entries(
+    entries: tuple[Entry, ...] | list[Entry],
+) -> tuple[dict[str, tuple[str, tuple[str, ...]]], dict[str, str]]:
+    """Resolve every name.  Returns ``(resolved, problems)``:
+    ``resolved[name] = (terminal_address, chain)``, ``problems[name] = reason``.
+    """
+    by_name = {e.service: e for e in entries}
+    resolved: dict[str, tuple[str, tuple[str, ...]]] = {}
+    problems: dict[str, str] = {}
+    for name in by_name:
+        try:
+            resolved[name] = _resolve_from(by_name, name)
+        except _ChainError as exc:
+            problems[name] = str(exc)
+    return resolved, problems
+
+
+def _compute_digest_v1(backup_name: str, version_id: int, entries: tuple[Entry, ...]) -> str:
+    """The original single-address digest; kept bit-compatible for old backups."""
     payload = json.dumps(
         {
-            "format": BACKUP_FORMAT,
+            "format": BACKUP_FORMAT_V1,
             "backup": backup_name,
             "version": version_id,
-            "entries": [{"service": s, "address": a} for s, a in entries],
+            "entries": [{"service": e.service, "address": e.address} for e in entries],
         },
         ensure_ascii=False,
         sort_keys=True,
         separators=(",", ":"),
     )
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _compute_digest_v2(backup_name: str, version_id: int, entries: tuple[Entry, ...]) -> str:
+    payload = json.dumps(
+        {
+            "format": BACKUP_FORMAT_V2,
+            "backup": backup_name,
+            "version": version_id,
+            "entries": [
+                {
+                    "service": e.service,
+                    "kind": e.kind,
+                    "address": e.address,
+                    "target": e.target,
+                }
+                for e in entries
+            ],
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _compute_digest(fmt: str, backup_name: str, version_id: int, entries: tuple[Entry, ...]) -> str:
+    if fmt == BACKUP_FORMAT_V1:
+        return _compute_digest_v1(backup_name, version_id, entries)
+    if fmt == BACKUP_FORMAT_V2:
+        return _compute_digest_v2(backup_name, version_id, entries)
+    raise ValueError(f"未知的备份格式: {fmt}")
 
 
 def _translate_db_error(exc: sqlite3.Error) -> DirectoryError:
@@ -169,25 +292,45 @@ class _PinnedView:
 
     def resolve(self, name: str | None = None) -> dict:
         service = validate_service_name(name) if name is not None else None
+        entries = self._store._entries(self._conn, self.version)
         if service is None:
-            rows = self._store._entries(self._conn, self.version)
-            return {
+            resolved, problems = _resolve_entries(entries)
+            body = {
                 "version": self.version,
-                "count": len(rows),
-                "services": dict(rows),
+                "count": len(entries),
+                "services": {n: addr for n, (addr, _chain) in resolved.items()},
                 "restore_in_progress": self.restore_in_progress,
                 "restore": self.restore,
             }
-        row = self._conn.execute(
-            "SELECT address FROM entries WHERE version_id=? AND service=?",
-            (self.version, service),
-        ).fetchone()
-        if row is None:
+            if problems:
+                body["unresolved"] = [
+                    {"service": n, "reason": problems[n]} for n in sorted(problems)
+                ]
+            return body
+        by_name = {e.service: e for e in entries}
+        entry = by_name.get(service)
+        if entry is None:
             raise NotFoundError(f"未知服务: {service}")
+        try:
+            address, chain_names = _resolve_from(by_name, service)
+        except _ChainError as exc:
+            raise ConflictError(str(exc), code=exc.code) from exc
+        chain: list[dict] = []
+        for nm in chain_names:
+            step_entry = by_name[nm]
+            step = {"service": nm, "kind": step_entry.kind}
+            if step_entry.is_alias:
+                step["target"] = step_entry.target
+            else:
+                step["address"] = step_entry.address
+            chain.append(step)
         return {
             "version": self.version,
             "name": service,
-            "address": str(row["address"]),
+            "kind": entry.kind,
+            "address": address,
+            "terminal": chain_names[-1],
+            "chain": chain,
             "restore_in_progress": self.restore_in_progress,
             "restore": self.restore,
         }
@@ -295,12 +438,15 @@ class DirectoryStore:
         ).fetchone()
         if has_meta:
             row = conn.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()
-            if row is None or str(row["value"]) != str(SCHEMA_VERSION):
-                raise RuntimeError(
-                    f"数据库 schema 版本不兼容：期望 {SCHEMA_VERSION}，实际 "
-                    f"{None if row is None else row['value']}"
-                )
-            return
+            version = None if row is None else str(row["value"])
+            if version == str(SCHEMA_VERSION):
+                return
+            if version == "1":
+                self._migrate_v1_to_v2(conn)
+                return
+            raise RuntimeError(
+                f"数据库 schema 版本不兼容：期望 {SCHEMA_VERSION}，实际 {version}"
+            )
         conn.execute(
             "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
         )
@@ -319,7 +465,9 @@ class DirectoryStore:
             CREATE TABLE entries (
                 version_id INTEGER NOT NULL REFERENCES versions(id) ON DELETE RESTRICT,
                 service TEXT NOT NULL,
-                address TEXT NOT NULL,
+                kind TEXT NOT NULL DEFAULT 'address',
+                address TEXT NOT NULL DEFAULT '',
+                target TEXT,
                 PRIMARY KEY (version_id, service)
             )
             """
@@ -334,7 +482,8 @@ class DirectoryStore:
                 version_id INTEGER NOT NULL REFERENCES versions(id) ON DELETE RESTRICT,
                 created_at TEXT NOT NULL,
                 digest TEXT NOT NULL,
-                entry_count INTEGER NOT NULL
+                entry_count INTEGER NOT NULL,
+                format TEXT NOT NULL DEFAULT 'svcdir-backup-v2'
             )
             """
         )
@@ -347,6 +496,17 @@ class DirectoryStore:
         self._meta_set(conn, "schema_version", str(SCHEMA_VERSION))
         self._meta_set(conn, "current_version", str(initial_version))
         self._meta_set(conn, "restore_state", "idle")
+
+    def _migrate_v1_to_v2(self, conn: sqlite3.Connection) -> None:
+        """Upgrade a v1 database in place: every existing row is a plain
+        address entry, and every existing backup keeps the v1 digest format so
+        it still validates with the original single-address rules."""
+        conn.execute("ALTER TABLE entries ADD COLUMN kind TEXT NOT NULL DEFAULT 'address'")
+        conn.execute("ALTER TABLE entries ADD COLUMN target TEXT")
+        conn.execute(
+            "ALTER TABLE backups ADD COLUMN format TEXT NOT NULL DEFAULT 'svcdir-backup-v1'"
+        )
+        self._meta_set(conn, "schema_version", str(SCHEMA_VERSION))
 
     # -- meta helpers -----------------------------------------------------
 
@@ -501,18 +661,27 @@ class DirectoryStore:
         )
         new_version = int(cur.lastrowid)
         conn.execute(
-            "INSERT INTO entries(version_id, service, address) "
-            "SELECT ?, service, address FROM entries WHERE version_id=?",
+            "INSERT INTO entries(version_id, service, kind, address, target) "
+            "SELECT ?, service, kind, address, target FROM entries WHERE version_id=?",
             (new_version, source_version),
         )
         return new_version
 
-    def _entries(self, conn: sqlite3.Connection, version_id: int) -> tuple[tuple[str, str], ...]:
+    def _entries(self, conn: sqlite3.Connection, version_id: int) -> tuple[Entry, ...]:
         rows = conn.execute(
-            "SELECT service, address FROM entries WHERE version_id=? ORDER BY service",
+            "SELECT service, kind, address, target FROM entries "
+            "WHERE version_id=? ORDER BY service",
             (version_id,),
         ).fetchall()
-        return tuple((str(r["service"]), str(r["address"])) for r in rows)
+        return tuple(
+            Entry(
+                service=str(r["service"]),
+                kind=str(r["kind"]),
+                address=str(r["address"]),
+                target=None if r["target"] is None else str(r["target"]),
+            )
+            for r in rows
+        )
 
     def _fire(self, name: str, payload: dict) -> None:
         hook = self._hooks.get(name)
@@ -530,7 +699,7 @@ class DirectoryStore:
         self._ensure_ready()
         with self._txn(write=False) as conn:
             rows = conn.execute(
-                "SELECT name, version_id, created_at, digest, entry_count "
+                "SELECT name, version_id, created_at, digest, entry_count, format "
                 "FROM backups ORDER BY created_at DESC, name"
             ).fetchall()
         return [
@@ -540,6 +709,7 @@ class DirectoryStore:
                 "created_at": str(r["created_at"]),
                 "digest": str(r["digest"]),
                 "entry_count": int(r["entry_count"]),
+                "format": str(r["format"]),
             }
             for r in rows
         ]
@@ -549,7 +719,7 @@ class DirectoryStore:
         self._ensure_ready()
         with self._txn(write=False) as conn:
             version = self._current_version(conn)
-            rows = self._entries(conn, version)
+            entries = self._entries(conn, version)
             restore = self._restore_summary(conn)
             backups = [
                 {
@@ -558,18 +728,32 @@ class DirectoryStore:
                     "created_at": str(r["created_at"]),
                     "digest": str(r["digest"]),
                     "entry_count": int(r["entry_count"]),
+                    "format": str(r["format"]),
                 }
                 for r in conn.execute(
-                    "SELECT name, version_id, created_at, digest, entry_count "
+                    "SELECT name, version_id, created_at, digest, entry_count, format "
                     "FROM backups ORDER BY created_at DESC, name"
                 ).fetchall()
             ]
+        resolved, problems = _resolve_entries(entries)
+        services = []
+        for entry in entries:
+            hit = resolved.get(entry.service)
+            services.append(
+                {
+                    "service": entry.service,
+                    "kind": entry.kind,
+                    "address": entry.address,
+                    "target": entry.target,
+                    "resolved": hit[0] if hit else None,
+                    "chain": list(hit[1]) if hit else None,
+                    "error": problems.get(entry.service),
+                }
+            )
         return {
             "version": version,
-            "count": len(rows),
-            "services": [
-                {"service": s, "address": a} for s, a in rows
-            ],
+            "count": len(entries),
+            "services": services,
             "restore": restore,
             "backups": backups,
         }
@@ -611,9 +795,14 @@ class DirectoryStore:
             new_version = self._create_version(
                 conn, previous, "update", clean_note or f"设置 {svc}"
             )
+            # Setting an address turns the name into a terminal.  Aliases
+            # pointing at it keep their target name, so they resolve to the
+            # new address within this same version.
             conn.execute(
-                "INSERT INTO entries(version_id, service, address) VALUES (?, ?, ?) "
-                "ON CONFLICT(version_id, service) DO UPDATE SET address=excluded.address",
+                "INSERT INTO entries(version_id, service, kind, address, target) "
+                "VALUES (?, ?, 'address', ?, NULL) "
+                "ON CONFLICT(version_id, service) DO UPDATE SET "
+                "kind='address', address=excluded.address, target=NULL",
                 (new_version, svc, addr),
             )
             self._set_current(conn, new_version)
@@ -621,7 +810,71 @@ class DirectoryStore:
             "version": new_version,
             "previous_version": previous,
             "service": svc,
+            "kind": KIND_ADDRESS,
             "address": addr,
+        }
+
+    def set_alias(self, service: Any, target: Any, note: Any = "") -> dict:
+        """Make ``service`` an alias of ``target``; chains are allowed.
+
+        Rejected (without publishing a new version) when the target cannot be
+        resolved to a terminal address, or when the new edge would create a
+        cycle or an over-long chain.
+        """
+        svc = validate_service_name(service)
+        tgt = validate_service_name(target)
+        clean_note = _clean_note(note)
+        if svc == tgt:
+            raise ConflictError(
+                f"设置该别名会形成环：{svc} → {svc}", code="alias_cycle"
+            )
+        self._ensure_ready()
+        with self._txn(write=True) as conn:
+            self._require_writable(conn)
+            previous = self._current_version(conn)
+            entries = self._entries(conn, previous)
+            by_name = {e.service: e for e in entries}
+            if svc not in by_name and len(entries) >= MAX_SERVICES:
+                raise InputError(f"服务数量超出上限 {MAX_SERVICES}")
+            if tgt not in by_name:
+                raise NotFoundError(f"别名目标不存在，找不到终点: {tgt}")
+            # Simulate the new edge on top of the current version and resolve
+            # the whole graph: every name must still reach a terminal.
+            trial = dict(by_name)
+            trial[svc] = Entry(svc, KIND_ALIAS, "", tgt)
+            try:
+                address, chain_names = _resolve_from(trial, svc)
+            except _ChainError as exc:
+                raise ConflictError(
+                    f"无法设置别名 {svc} → {tgt}：{exc}，未发布新版本",
+                    code=exc.code,
+                ) from exc
+            _ok, problems = _resolve_entries(list(trial.values()))
+            if problems:
+                raise ConflictError(
+                    f"无法设置别名 {svc} → {tgt}：会使其他名称的解析链失效，未发布新版本",
+                    code="broken_chain",
+                    details=[f"{n}: {problems[n]}" for n in sorted(problems)][:8],
+                )
+            new_version = self._create_version(
+                conn, previous, "update", clean_note or f"设置别名 {svc} → {tgt}"
+            )
+            conn.execute(
+                "INSERT INTO entries(version_id, service, kind, address, target) "
+                "VALUES (?, ?, 'alias', '', ?) "
+                "ON CONFLICT(version_id, service) DO UPDATE SET "
+                "kind='alias', address='', target=excluded.target",
+                (new_version, svc, tgt),
+            )
+            self._set_current(conn, new_version)
+        return {
+            "version": new_version,
+            "previous_version": previous,
+            "service": svc,
+            "kind": KIND_ALIAS,
+            "target": tgt,
+            "address": address,
+            "chain": list(chain_names),
         }
 
     def delete(self, service: Any) -> dict:
@@ -630,15 +883,26 @@ class DirectoryStore:
         with self._txn(write=True) as conn:
             self._require_writable(conn)
             previous = self._current_version(conn)
+            entries = self._entries(conn, previous)
+            by_name = {e.service: e for e in entries}
+            if svc not in by_name:
+                raise NotFoundError(f"未知服务: {svc}")
+            referrers = sorted(
+                e.service for e in entries if e.is_alias and e.target == svc
+            )
+            if referrers:
+                raise ConflictError(
+                    f"无法删除 {svc}：仍被 {len(referrers)} 个别名引用，未发布新版本",
+                    code="name_in_use",
+                    details=[f"{r} → {svc}" for r in referrers[:8]],
+                )
             new_version = self._create_version(
                 conn, previous, "update", f"删除 {svc}"
             )
-            cur = conn.execute(
+            conn.execute(
                 "DELETE FROM entries WHERE version_id=? AND service=?",
                 (new_version, svc),
             )
-            if cur.rowcount == 0:
-                raise NotFoundError(f"未知服务: {svc}")
             self._set_current(conn, new_version)
         return {
             "version": new_version,
@@ -657,12 +921,12 @@ class DirectoryStore:
             entries = self._entries(conn, version)
             if len(entries) > MAX_SERVICES:
                 raise InputError(f"服务数量超出上限 {MAX_SERVICES}")
-            digest = _compute_digest(backup_name, version, entries)
+            digest = _compute_digest(BACKUP_FORMAT, backup_name, version, entries)
             created_at = _utc_now_iso()
             conn.execute(
-                "INSERT INTO backups(name, version_id, created_at, digest, entry_count) "
-                "VALUES (?, ?, ?, ?, ?)",
-                (backup_name, version, created_at, digest, len(entries)),
+                "INSERT INTO backups(name, version_id, created_at, digest, entry_count, format) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (backup_name, version, created_at, digest, len(entries), BACKUP_FORMAT),
             )
         self._fire("after_backup_created", {"name": backup_name, "version": version})
         return {
@@ -671,6 +935,7 @@ class DirectoryStore:
             "created_at": created_at,
             "digest": digest,
             "entry_count": len(entries),
+            "format": BACKUP_FORMAT,
         }
 
     # -- backup validation ------------------------------------------------
@@ -691,13 +956,14 @@ class DirectoryStore:
 
     def _validate_backup(self, conn: sqlite3.Connection, backup_name: str) -> BackupValidation:
         row = conn.execute(
-            "SELECT name, version_id, created_at, digest, entry_count "
+            "SELECT name, version_id, created_at, digest, entry_count, format "
             "FROM backups WHERE name=?",
             (backup_name,),
         ).fetchone()
         if row is None:
             raise NotFoundError(f"备份不存在: {backup_name}")
         version_id = int(row["version_id"])
+        fmt = str(row["format"]) if row["format"] else BACKUP_FORMAT_V1
         problems: list[str] = []
         if conn.execute("SELECT 1 FROM versions WHERE id=?", (version_id,)).fetchone() is None:
             raise BackupValidationError(
@@ -712,28 +978,51 @@ class DirectoryStore:
             problems.append(
                 f"条目数量不一致：备份记录 {recorded_count}，实际 {len(entries)}"
             )
-        if len({s for s, _ in entries}) != len(entries):
+        if len({e.service for e in entries}) != len(entries):
             problems.append("存在重复的服务名")
+        if fmt not in (BACKUP_FORMAT_V1, BACKUP_FORMAT_V2):
+            problems.append(f"未知的备份格式: {fmt}")
+        if fmt == BACKUP_FORMAT_V1 and any(e.is_alias for e in entries):
+            problems.append("旧格式备份不应包含别名条目")
         seen: set[str] = set()
-        for service, address in entries:
-            if service in seen:
+        for entry in entries:
+            if entry.service in seen:
                 continue
-            seen.add(service)
+            seen.add(entry.service)
             try:
-                validate_service_name(service)
+                validate_service_name(entry.service)
             except DirectoryError as exc:
-                problems.append(f"服务名 {service!r} 无效：{exc.message}")
-            try:
-                validate_address(address)
-            except DirectoryError as exc:
-                problems.append(f"服务 {service!r} 的地址无效：{exc.message}")
+                problems.append(f"服务名 {entry.service!r} 无效：{exc.message}")
+            if entry.is_alias:
+                if not entry.target:
+                    problems.append(f"别名 {entry.service!r} 缺少目标名称")
+                else:
+                    try:
+                        validate_service_name(entry.target)
+                    except DirectoryError as exc:
+                        problems.append(
+                            f"别名 {entry.service!r} 的目标 {entry.target!r} 无效：{exc.message}"
+                        )
+            else:
+                try:
+                    validate_address(entry.address)
+                except DirectoryError as exc:
+                    problems.append(f"服务 {entry.service!r} 的地址无效：{exc.message}")
             if len(problems) >= 8:
                 break
+        # Alias-chain integrity: every name must resolve to a terminal
+        # address.  A corrupted chain (dangling target, cycle, over-long)
+        # makes the backup unrestorable.
+        _resolved, chain_problems = _resolve_entries(entries)
+        for name in sorted(chain_problems):
+            if len(problems) >= 8:
+                break
+            problems.append(f"解析链损坏：{chain_problems[name]}")
         stored_digest = str(row["digest"])
         if not DIGEST_RE.fullmatch(stored_digest):
             problems.append("备份摘要格式无效")
-        else:
-            recomputed = _compute_digest(backup_name, version_id, entries)
+        elif fmt in (BACKUP_FORMAT_V1, BACKUP_FORMAT_V2):
+            recomputed = _compute_digest(fmt, backup_name, version_id, entries)
             if not hmac.compare_digest(stored_digest, recomputed):
                 problems.append("内容摘要不匹配（备份可能被篡改或损坏）")
         if problems:

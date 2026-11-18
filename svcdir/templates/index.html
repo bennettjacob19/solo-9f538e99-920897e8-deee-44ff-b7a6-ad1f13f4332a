@@ -10,7 +10,7 @@
 <body>
 <header>
   <h1>本地服务发现目录</h1>
-  <p class="sub">修改服务名到目标地址的映射，创建命名备份，并在需要时从备份恢复。</p>
+  <p class="sub">修改服务名到目标地址的映射、把名称设为另一名称的别名（可串联），创建命名备份，并在需要时从备份恢复。</p>
 </header>
 
 <main>
@@ -28,12 +28,23 @@
     <h2>当前目录 <span class="badge">版本 {{ state.version }} · {{ state.count }} 项</span></h2>
     {% if state.services %}
     <table>
-      <thead><tr><th>服务名</th><th>目标地址</th><th></th></tr></thead>
+      <thead><tr><th>服务名</th><th>类型</th><th>内容</th><th>解析结果</th><th></th></tr></thead>
       <tbody>
       {% for row in state.services %}
         <tr>
           <td class="mono">{{ row.service }}</td>
-          <td class="mono">{{ row.address }}</td>
+          <td>{% if row.kind == 'alias' %}<span class="tag alias">别名</span>{% else %}<span class="tag">地址</span>{% endif %}</td>
+          <td class="mono">{% if row.kind == 'alias' %}→ {{ row.target }}{% else %}{{ row.address }}{% endif %}</td>
+          <td class="mono">
+            {% if row.error %}
+              <span class="bad-text">无法解析：{{ row.error }}</span>
+            {% else %}
+              {{ row.resolved }}
+              {% if row.kind == 'alias' and row.chain %}
+                <br><span class="muted small">{{ row.chain | join(' → ') }}</span>
+              {% endif %}
+            {% endif %}
+          </td>
           <td class="right">
             <form method="post" action="{{ url_for('form_delete', service=row.service) }}"
                   data-confirm="确认删除 {name}？" data-name="{{ row.service }}">
@@ -45,12 +56,12 @@
       </tbody>
     </table>
     {% else %}
-    <p class="muted">目录为空。请在下方添加服务。</p>
+    <p class="muted">目录为空。请在下方添加服务或别名。</p>
     {% endif %}
   </section>
 
   <section class="card">
-    <h2>新增 / 修改服务</h2>
+    <h2>新增 / 修改地址</h2>
     <form method="post" action="{{ url_for('form_upsert') }}" class="grid">
       <label>服务名
         <input name="service" required maxlength="128" placeholder="orders-api">
@@ -61,8 +72,40 @@
       <label>备注（可选）
         <input name="note" maxlength="200" placeholder="变更原因">
       </label>
-      <button type="submit">保存</button>
+      <button type="submit">保存地址</button>
     </form>
+    <p class="muted small">对已有别名设置地址会把它改回普通地址项；指向它的别名会在同一版本解析到新地址。</p>
+  </section>
+
+  <section class="card">
+    <h2>设置别名</h2>
+    <form method="post" action="{{ url_for('form_set_alias') }}" class="grid">
+      <label>服务名
+        <input name="service" required maxlength="128" placeholder="orders">
+      </label>
+      <label>指向的名称
+        <input name="target" required maxlength="128" placeholder="orders-api">
+      </label>
+      <label>备注（可选）
+        <input name="note" maxlength="200" placeholder="变更原因">
+      </label>
+      <button type="submit">保存别名</button>
+    </form>
+    <p class="muted small">
+      别名可以再指向别名（串联）。会成环、找不到终点，或删除仍被别名引用的名称，都会被拒绝且不会发布新版本。
+    </p>
+  </section>
+
+  <section class="card">
+    <h2>查询解析</h2>
+    <form id="resolve-form" method="get" action="/resolve" class="inline">
+      <input name="name" required maxlength="128" placeholder="输入服务名或别名">
+      <button type="submit">查询</button>
+    </form>
+    <div id="resolve-result" class="resolve-result" aria-live="polite"></div>
+    <p class="muted small">
+      单名查询返回当前终点地址与完整解析链；不带名称则返回整个目录的终点地址。
+    </p>
   </section>
 
   <section class="card">
@@ -72,7 +115,7 @@
       <button type="submit">创建备份</button>
     </form>
     <p class="muted small">
-      备份在创建时固定一个完整的目录版本，之后的修改不会影响它。
+      备份在创建时固定一个完整的目录版本（含别名关系），之后的修改不会影响它。
     </p>
 
     {% if state.backups %}
@@ -103,7 +146,10 @@
 
   <section class="card">
     <h2>查询 API</h2>
-    <p class="mono small">GET /resolve?name=&lt;服务名&gt; &nbsp;·&nbsp; GET /resolve（返回整个目录）</p>
+    <p class="mono small">
+      GET /resolve?name=&lt;服务名&gt;（含解析链） &nbsp;·&nbsp; GET /resolve（整个目录的终点地址）<br>
+      POST /api/services {"service", "address"} &nbsp;·&nbsp; POST /api/aliases {"service", "target"}
+    </p>
   </section>
 </main>
 </body>

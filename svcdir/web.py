@@ -116,10 +116,15 @@ def create_app(store: DirectoryStore | None = None, *, config: dict | None = Non
         }
         if "address" in result:
             body["name"] = result["name"]
+            body["kind"] = result["kind"]
             body["address"] = result["address"]
+            body["terminal"] = result["terminal"]
+            body["chain"] = result["chain"]
         else:
             body["count"] = result["count"]
             body["services"] = result["services"]
+            if "unresolved" in result:
+                body["unresolved"] = result["unresolved"]
         return jsonify(body)
 
     @app.get("/api/state")
@@ -137,6 +142,16 @@ def create_app(store: DirectoryStore | None = None, *, config: dict | None = Non
             raise InputError("请求体必须是 JSON 对象")
         result = store.upsert(
             payload.get("service"), payload.get("address"), payload.get("note", "")
+        )
+        return jsonify({"ok": True, **result}), 200
+
+    @app.post("/api/aliases")
+    def api_set_alias():
+        payload = request.get_json(silent=True)
+        if not isinstance(payload, dict):
+            raise InputError("请求体必须是 JSON 对象")
+        result = store.set_alias(
+            payload.get("service"), payload.get("target"), payload.get("note", "")
         )
         return jsonify({"ok": True, **result}), 200
 
@@ -182,6 +197,20 @@ def create_app(store: DirectoryStore | None = None, *, config: dict | None = Non
             return _redirect_back(error=exc.message)
         return _redirect_back(
             message=f"已保存 {result['service']} -> {result['address']}（目录版本 {result['version']}）"
+        )
+
+    @app.post("/aliases")
+    def form_set_alias():
+        try:
+            result = store.set_alias(
+                request.form.get("service"), request.form.get("target"), request.form.get("note", "")
+            )
+        except DirectoryError as exc:
+            return _redirect_back(error=exc.message)
+        chain = " → ".join(result["chain"])
+        return _redirect_back(
+            message=f"已设置别名 {result['service']} → {result['target']}"
+                    f"（解析链 {chain}，终点 {result['address']}，目录版本 {result['version']}）"
         )
 
     @app.post("/services/<path:service>/delete")

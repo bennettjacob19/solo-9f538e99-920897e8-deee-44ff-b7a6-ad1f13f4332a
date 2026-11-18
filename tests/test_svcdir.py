@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 import sqlite3
 import threading
@@ -15,6 +17,7 @@ from svcdir.errors import (
     NotFoundError,
     RestoreInProgress,
 )
+from svcdir.store import BACKUP_FORMAT_V2, Entry, _compute_digest
 
 
 @pytest.fixture()
@@ -781,3 +784,516 @@ def test_html_escapes_hostile_names(client):
     resp = client.get("/")
     assert resp.headers["X-Content-Type-Options"] == "nosniff"
     assert "script-src 'self'" in resp.headers["Content-Security-Policy"]
+
+
+# ---------------------------------------------------------------------------
+# Aliases: resolution
+
+
+def test_alias_resolve_single_shows_chain(store):
+    store.upsert("orders-api", "10.0.0.12:8080")
+    store.set_alias("orders", "orders-api")
+    result = store.resolve("orders")
+    assert result["address"] == "10.0.0.12:8080"
+    assert result["kind"] == "alias"
+    assert result["terminal"] == "orders-api"
+    assert [step["service"] for step in result["chain"]] == ["orders", "orders-api"]
+    assert result["chain"][0]["target"] == "orders-api"
+    assert result["chain"][1]["address"] == "10.0.0.12:8080"
+    # A terminal resolves to itself with a one-step chain.
+    direct = store.resolve("orders-api")
+    assert direct["kind"] == "address"
+    assert direct["terminal"] == "orders-api"
+    assert [s["service"] for s in direct["chain"]] == ["orders-api"]
+
+
+def test_alias_chaining(store):
+    store.upsert("c", "10.0.0.3:80")
+    store.set_alias("b", "c")
+    result = store.set_alias("a", "b")
+    assert result["chain"] == ["a", "b", "c"]
+    resolved = store.resolve("a")
+    assert resolved["address"] == "10.0.0.3:80"
+    assert [s["service"] for s in resolved["chain"]] == ["a", "b", "c"]
+
+
+def test_alias_full_directory_returns_terminal_addresses(store):
+    store.upsert("orders-api", "10.0.0.12:8080")
+    store.upsert("billing-api", "10.0.0.13:8080")
+    store.set_alias("orders", "orders-api")
+    store.set_alias("web-orders", "orders")
+    result = store.resolve()
+    assert result["services"] == {
+        "orders-api": "10.0.0.12:8080",
+        "billing-api": "10.0.0.13:8080",
+        "orders": "10.0.0.12:8080",
+        "web-orders": "10.0.0.12:8080",
+    }
+    assert "unresolved" not in result
+
+
+def test_terminal_readdress_moves_all_aliases_in_same_version(store):
+    store.upsert("orders-api", "10.0.0.1:80")
+    store.set_alias("orders", "orders-api")
+    store.set_alias("web-orders", "orders")
+    move = store.upsert("orders-api", "10.0.0.2:80")
+    with store.read_view() as view:
+        for name in ("orders-api", "orders", "web-orders"):
+            resolved = view.resolve(name)
+            assert resolved["address"] == "10.0.0.2:80"
+            assert resolved["version"] == move["version"]
+    full = store.resolve()
+    assert full["version"] == move["version"]
+    assert full["services"]["web-orders"] == "10.0.0.2:80"
+
+
+def test_alias_and_address_conversions(store):
+    store.upsert("a", "1.1.1.1:80")
+    store.set_alias("b", "a")
+    # Re-addressing an alias turns it back into a terminal.
+    store.upsert("b", "2.2.2.2:80")
+    assert store.resolve("b")["kind"] == "address"
+    assert store.resolve("b")["address"] == "2.2.2.2:80"
+    # Setting an alias on a terminal turns it into an alias.
+    store.set_alias("a", "b")
+    assert store.resolve("a")["kind"] == "alias"
+    assert store.resolve("a")["address"] == "2.2.2.2:80"
+
+
+# ---------------------------------------------------------------------------
+# Aliases: rejection rules (no new version published)
+
+
+def test_alias_cycle_rejected_and_no_new_version(store):
+    store.upsert("a", "1.1.1.1:80")
+    store.set_alias("b", "a")
+    store.set_alias("c", "a")
+    store.set_alias("d", "c")
+    before = store.resolve()
+    # Direct 2-cycle: a -> b while b -> a.
+    with pytest.raises(ConflictError) as excinfo:
+        store.set_alias("a", "b")
+    assert excinfo.value.code == "alias_cycle"
+    # Longer cycle: a -> d -> c -> a.
+    with pytest.raises(ConflictError) as excinfo:
+        store.set_alias("a", "d")
+    assert excinfo.value.code == "alias_cycle"
+    # Self-alias.
+    with pytest.raises(ConflictError) as excinfo:
+        store.set_alias("a", "a")
+    assert excinfo.value.code == "alias_cycle"
+    after = store.resolve()
+    assert after["version"] == before["version"]
+    assert after["services"] == before["services"]
+
+
+def test_alias_to_missing_target_rejected_and_no_new_version(store):
+    store.upsert("a", "1.1.1.1:80")
+    before = store.resolve()
+    with pytest.raises(NotFoundError):
+        store.set_alias("b", "ghost")
+    after = store.resolve()
+    assert after["version"] == before["version"]
+    assert after["services"] == before["services"]
+
+
+def test_delete_referenced_name_rejected_and_no_new_version(store):
+    store.upsert("orders-api", "10.0.0.12:8080")
+    store.set_alias("orders", "orders-api")
+    store.set_alias("web-orders", "orders")
+    before = store.resolve()
+    # orders-api is referenced by orders; orders is referenced by web-orders.
+    for victim in ("orders-api", "orders"):
+        with pytest.raises(ConflictError) as excinfo:
+            store.delete(victim)
+        assert excinfo.value.code == "name_in_use"
+    after = store.resolve()
+    assert after["version"] == before["version"]
+    assert after["services"] == before["services"]
+    # Deleting the unreferenced alias head works, then the next link, etc.
+    store.delete("web-orders")
+    store.delete("orders")
+    store.delete("orders-api")
+    assert store.resolve()["services"] == {}
+
+
+def test_chain_length_limit(store):
+    from svcdir.store import MAX_CHAIN_LENGTH
+
+    store.upsert("n0", "1.1.1.1:80")
+    for i in range(1, MAX_CHAIN_LENGTH):
+        store.set_alias(f"n{i}", f"n{i-1}")
+    assert store.resolve(f"n{MAX_CHAIN_LENGTH - 1}")["address"] == "1.1.1.1:80"
+    before = store.resolve()
+    with pytest.raises(ConflictError) as excinfo:
+        store.set_alias(f"n{MAX_CHAIN_LENGTH}", f"n{MAX_CHAIN_LENGTH - 1}")
+    assert excinfo.value.code == "chain_too_long"
+    assert store.resolve()["version"] == before["version"]
+
+
+# ---------------------------------------------------------------------------
+# Aliases: backups and restore
+
+
+def test_backup_and_restore_preserve_aliases(store):
+    store.upsert("orders-api", "10.0.0.1:80")
+    store.set_alias("orders", "orders-api")
+    store.set_alias("web-orders", "orders")
+    created = store.create_backup("with-aliases")
+    assert created["format"] == BACKUP_FORMAT_V2
+    # Change everything after the backup.
+    store.upsert("orders-api", "10.0.9.9:80")
+    store.delete("web-orders")
+    store.upsert("extra", "5.5.5.5:80")
+    result = store.restore_backup("with-aliases")
+    assert result["entry_count"] == 3
+    full = store.resolve()
+    assert full["services"] == {
+        "orders-api": "10.0.0.1:80",
+        "orders": "10.0.0.1:80",
+        "web-orders": "10.0.0.1:80",
+    }
+    single = store.resolve("web-orders")
+    assert [s["service"] for s in single["chain"]] == ["web-orders", "orders", "orders-api"]
+
+
+def _tamper_entries(db_path, version_id, service, **columns):
+    with sqlite3.connect(db_path) as conn:
+        for column, value in columns.items():
+            conn.execute(
+                f"UPDATE entries SET {column}=? WHERE version_id=? AND service=?",
+                (value, version_id, service),
+            )
+
+
+def _rewrite_backup_digest(db_path, backup_name):
+    """Recompute the v2 digest after tampering, so only semantics are broken."""
+    with sqlite3.connect(db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            "SELECT version_id FROM backups WHERE name=?", (backup_name,)
+        ).fetchone()
+        version_id = row["version_id"]
+        rows = conn.execute(
+            "SELECT service, kind, address, target FROM entries WHERE version_id=? "
+            "ORDER BY service",
+            (version_id,),
+        ).fetchall()
+        entries = tuple(
+            Entry(str(r["service"]), str(r["kind"]), str(r["address"]), r["target"])
+            for r in rows
+        )
+        digest = _compute_digest(BACKUP_FORMAT_V2, backup_name, version_id, entries)
+        conn.execute(
+            "UPDATE backups SET digest=? WHERE name=?", (digest, backup_name)
+        )
+
+
+def test_backup_with_dangling_chain_is_rejected(store):
+    store.upsert("orders-api", "10.0.0.1:80")
+    store.set_alias("orders", "orders-api")
+    backup = store.create_backup("b1")
+    store.upsert("orders-api", "10.0.0.2:80")
+    before = store.resolve()
+    # Break the archived chain but keep the digest consistent.
+    _tamper_entries(store.db_path, backup["version"], "orders", target="ghost")
+    _rewrite_backup_digest(store.db_path, "b1")
+    with pytest.raises(BackupValidationError) as excinfo:
+        store.restore_backup("b1")
+    assert any("解析链" in d for d in excinfo.value.details)
+    with pytest.raises(BackupValidationError):
+        store.validate_backup("b1")
+    after = store.resolve()
+    assert after["version"] == before["version"]
+    assert after["services"] == before["services"]
+
+
+def test_backup_with_cycle_is_rejected(store):
+    store.upsert("a", "1.1.1.1:80")
+    store.set_alias("b", "a")
+    backup = store.create_backup("b1")
+    store.upsert("a", "2.2.2.2:80")
+    before = store.resolve()
+    # Turn the archived a -> b into a cycle a -> b -> a.
+    _tamper_entries(
+        store.db_path, backup["version"], "a", kind="alias", address="", target="b"
+    )
+    _rewrite_backup_digest(store.db_path, "b1")
+    with pytest.raises(BackupValidationError) as excinfo:
+        store.restore_backup("b1")
+    assert any("环" in d for d in excinfo.value.details)
+    after = store.resolve()
+    assert after["version"] == before["version"]
+    assert after["services"] == before["services"]
+
+
+# ---------------------------------------------------------------------------
+# Aliases: old databases and old backups
+
+
+def _build_v1_database(path, entries: dict[str, str], backups: tuple[str, ...] = ()):
+    """Create a schema-v1 database exactly as the pre-alias code did."""
+    conn = sqlite3.connect(path)
+    conn.execute("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+    conn.execute(
+        "CREATE TABLE versions (id INTEGER PRIMARY KEY AUTOINCREMENT, "
+        "created_at TEXT NOT NULL, kind TEXT NOT NULL, note TEXT NOT NULL DEFAULT '')"
+    )
+    conn.execute(
+        "CREATE TABLE entries (version_id INTEGER NOT NULL REFERENCES versions(id) "
+        "ON DELETE RESTRICT, service TEXT NOT NULL, address TEXT NOT NULL, "
+        "PRIMARY KEY (version_id, service))"
+    )
+    conn.execute("CREATE INDEX idx_entries_service ON entries(service)")
+    conn.execute(
+        "CREATE TABLE backups (name TEXT PRIMARY KEY, version_id INTEGER NOT NULL "
+        "REFERENCES versions(id) ON DELETE RESTRICT, created_at TEXT NOT NULL, "
+        "digest TEXT NOT NULL, entry_count INTEGER NOT NULL)"
+    )
+    now = "2026-01-01T00:00:00Z"
+    cur = conn.execute(
+        "INSERT INTO versions(created_at, kind, note) VALUES (?, 'initial', '初始空目录')",
+        (now,),
+    )
+    empty_version = int(cur.lastrowid)
+    cur = conn.execute(
+        "INSERT INTO versions(created_at, kind, note) VALUES (?, 'update', 'seed')", (now,)
+    )
+    live_version = int(cur.lastrowid)
+    for service, address in entries.items():
+        conn.execute(
+            "INSERT INTO entries(version_id, service, address) VALUES (?, ?, ?)",
+            (live_version, service, address),
+        )
+    conn.execute("INSERT INTO meta(key, value) VALUES ('schema_version', '1')")
+    conn.execute("INSERT INTO meta(key, value) VALUES ('current_version', ?)", (str(live_version),))
+    conn.execute("INSERT INTO meta(key, value) VALUES ('restore_state', 'idle')")
+    for backup_name in backups:
+        ordered = sorted(entries.items())
+        payload = json.dumps(
+            {
+                "format": "svcdir-backup-v1",
+                "backup": backup_name,
+                "version": live_version,
+                "entries": [{"service": s, "address": a} for s, a in ordered],
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()
+        conn.execute(
+            "INSERT INTO backups(name, version_id, created_at, digest, entry_count) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (backup_name, live_version, now, digest, len(ordered)),
+        )
+    assert empty_version < live_version
+    conn.commit()
+    conn.close()
+
+
+def test_v1_database_migrates_and_old_backup_still_restores(tmp_path):
+    db = tmp_path / "old.sqlite3"
+    _build_v1_database(db, {"a": "1.1.1.1:80", "b": "2.2.2.2:80"}, backups=("old-snap",))
+
+    store = DirectoryStore(db)
+    # Old data resolves under the original single-address rules.
+    assert store.resolve("a")["address"] == "1.1.1.1:80"
+    assert store.resolve("a")["kind"] == "address"
+    # The database was migrated in place.
+    with sqlite3.connect(db) as conn:
+        version = conn.execute(
+            "SELECT value FROM meta WHERE key='schema_version'"
+        ).fetchone()[0]
+    assert version == "2"
+    # The old backup validates with its original digest and restores.
+    assert store.validate_backup("old-snap")["valid"] is True
+    store.upsert("a", "9.9.9.9:80")
+    store.set_alias("web", "b")
+    result = store.restore_backup("old-snap")
+    assert result["entry_count"] == 2
+    assert store.resolve()["services"] == {"a": "1.1.1.1:80", "b": "2.2.2.2:80"}
+    # Aliases work on the migrated database, and new backups are v2.
+    store.set_alias("web", "a")
+    assert store.resolve("web")["address"] == "1.1.1.1:80"
+    created = store.create_backup("new-snap")
+    assert created["format"] == BACKUP_FORMAT_V2
+    formats = {b["name"]: b["format"] for b in store.list_backups()}
+    assert formats == {"old-snap": "svcdir-backup-v1", "new-snap": BACKUP_FORMAT_V2}
+
+
+def test_v1_backup_with_tampered_rows_still_rejected(tmp_path):
+    db = tmp_path / "old.sqlite3"
+    _build_v1_database(db, {"a": "1.1.1.1:80"}, backups=("old-snap",))
+    store = DirectoryStore(db)
+    # Move the live version past the backup so tampering only hits the archive.
+    store.upsert("a", "live-now")
+    backup = next(b for b in store.list_backups() if b["name"] == "old-snap")
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            "UPDATE entries SET address='tampered' WHERE version_id=? AND service='a'",
+            (backup["version"],),
+        )
+    with pytest.raises(BackupValidationError):
+        store.restore_backup("old-snap")
+    assert store.resolve("a")["address"] == "live-now"
+
+
+# ---------------------------------------------------------------------------
+# Aliases: interleavings
+
+
+def test_alias_reads_see_one_version_while_terminal_moves(store):
+    """Every full-directory read shows the alias and its terminal from one version."""
+    store.upsert("t", "v0")
+    store.set_alias("a", "t")
+    stop = threading.Event()
+    mismatches: list[dict] = []
+
+    def writer():
+        i = 0
+        while not stop.is_set():
+            store.upsert("t", f"v{i % 2}")
+            i += 1
+
+    def reader():
+        while not stop.is_set():
+            services = store.resolve()["services"]
+            if services.get("a") != services.get("t"):
+                mismatches.append(services)
+
+    threads = [threading.Thread(target=writer)] + [
+        threading.Thread(target=reader) for _ in range(3)
+    ]
+    for th in threads:
+        th.start()
+    time.sleep(0.4)
+    stop.set()
+    for th in threads:
+        th.join(10)
+    assert not mismatches, mismatches[:3]
+
+
+def test_alias_chain_consistent_across_restore(store):
+    """A read view pinned before the restore switch keeps its whole chain."""
+    store.upsert("t", "old-addr")
+    store.set_alias("a", "t")
+    store.create_backup("snap")
+    store.upsert("t", "live-addr")
+
+    gate = BlockingHooks().install(store, "validated")
+    thread = threading.Thread(target=store.restore_backup, args=("snap",))
+    thread.start()
+    assert gate.reached.wait(10)
+
+    with store.read_view() as view:
+        first = view.resolve("a")
+        assert first["address"] == "live-addr"
+        assert first["restore_in_progress"] is True
+        gate.release.set()
+        thread.join(10)
+        # Same request, after the switch: still the pre-restore chain.
+        second = view.resolve("a")
+        assert second["address"] == "live-addr"
+        assert second["version"] == first["version"]
+        assert [s["service"] for s in second["chain"]] == ["a", "t"]
+
+    after = store.resolve("a")
+    assert after["address"] == "old-addr"
+    assert [s["service"] for s in after["chain"]] == ["a", "t"]
+
+
+def test_alias_writes_rejected_during_restore(store):
+    store.upsert("t", "old-addr")
+    store.set_alias("a", "t")
+    store.create_backup("snap")
+    store.upsert("t", "live-addr")
+
+    gate = BlockingHooks().install(store, "validated")
+    thread = threading.Thread(target=store.restore_backup, args=("snap",))
+    thread.start()
+    assert gate.reached.wait(10)
+
+    with pytest.raises(RestoreInProgress):
+        store.set_alias("b", "t")
+    with pytest.raises(RestoreInProgress):
+        store.delete("a")
+
+    gate.release.set()
+    thread.join(10)
+    assert store.resolve("a")["address"] == "old-addr"
+    with pytest.raises(NotFoundError):
+        store.resolve("b")
+
+
+# ---------------------------------------------------------------------------
+# Aliases: HTTP layer
+
+
+def test_http_alias_flow(client):
+    assert client.post(
+        "/api/services", json={"service": "orders-api", "address": "10.0.0.12:8080"}
+    ).status_code == 200
+    resp = client.post("/api/aliases", json={"service": "orders", "target": "orders-api"})
+    assert resp.status_code == 200
+    assert resp.get_json()["chain"] == ["orders", "orders-api"]
+    resp = client.post("/api/aliases", json={"service": "web", "target": "orders"})
+    assert resp.status_code == 200
+
+    resolved = client.get("/resolve?name=web").get_json()
+    assert resolved["address"] == "10.0.0.12:8080"
+    assert resolved["kind"] == "alias"
+    assert resolved["terminal"] == "orders-api"
+    assert [s["service"] for s in resolved["chain"]] == ["web", "orders", "orders-api"]
+
+    full = client.get("/resolve").get_json()
+    assert full["services"]["web"] == "10.0.0.12:8080"
+    assert full["services"]["orders"] == "10.0.0.12:8080"
+
+    # The browser form sets aliases too.
+    resp = client.post(
+        "/aliases", data={"service": "www", "target": "web"}, follow_redirects=False
+    )
+    assert resp.status_code == 303
+    assert client.get("/resolve?name=www").get_json()["address"] == "10.0.0.12:8080"
+
+    page = client.get("/").get_data(as_text=True)
+    assert "别名" in page
+    assert "orders-api" in page
+    assert "设置别名" in page
+
+
+def test_http_alias_rejections(client):
+    client.post("/api/services", json={"service": "a", "address": "1.1.1.1:80"})
+    client.post("/api/aliases", json={"service": "b", "target": "a"})
+    version_before = client.get("/api/state").get_json()["version"]
+
+    cycle = client.post("/api/aliases", json={"service": "a", "target": "b"})
+    assert cycle.status_code == 409
+    assert cycle.get_json()["error"]["code"] == "alias_cycle"
+
+    missing = client.post("/api/aliases", json={"service": "c", "target": "ghost"})
+    assert missing.status_code == 404
+
+    referenced = client.delete("/api/services/a")
+    assert referenced.status_code == 409
+    assert referenced.get_json()["error"]["code"] == "name_in_use"
+
+    # The form surfaces the rejection and nothing was published.
+    page = client.post(
+        "/aliases", data={"service": "a", "target": "b"}, follow_redirects=True
+    )
+    assert "环" in page.get_data(as_text=True)
+    assert client.get("/api/state").get_json()["version"] == version_before
+
+
+def test_resolve_query_box_on_page(client):
+    client.post("/api/services", json={"service": "a", "address": "1.1.1.1:80"})
+    client.post("/api/aliases", json={"service": "b", "target": "a"})
+    page = client.get("/").get_data(as_text=True)
+    assert 'id="resolve-form"' in page
+    assert 'action="/resolve"' in page
+    # The form degrades to a plain GET on /resolve without JavaScript.
+    resp = client.get("/resolve?name=b")
+    assert resp.status_code == 200
+    assert resp.get_json()["address"] == "1.1.1.1:80"
